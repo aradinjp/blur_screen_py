@@ -1,4 +1,4 @@
-"""Offline CPU anonymisation: OCR seeds, checked bidirectional flow, object fallback.
+"""Offline anonymisation: OCR seeds, checked bidirectional flow, object fallback.
 
 Only geometry, phrase indices and aggregate timings enter diagnostics. Frame numbers
 are zero based. No input video is modified; output is committed only after validation.
@@ -13,9 +13,9 @@ from itertools import combinations
 import json
 import math
 import os
+import platform
 from pathlib import Path
 import re
-import resource
 import shutil
 import subprocess
 import sys
@@ -25,6 +25,8 @@ import unicodedata
 
 import cv2
 import numpy as np
+
+from hardware import OCRBackendError, hardware_info, peak_rss_mb, select_device
 
 
 MONTHS = {name: short for short, names in [
@@ -442,18 +444,96 @@ def load_config(path):
 
 
 class OCR:
-    def __init__(self, threads, languages, download=False):
+    def __init__(self, threads, languages, download=False, device="cpu"):
         os.environ["OMP_NUM_THREADS"] = str(threads)
         import torch
         import easyocr
+        self.torch = torch
+        self.easyocr = easyocr
+        self.languages = languages
+        self.download = download
+        self.requested_device = device
+        self.device = select_device(device, torch)
+        self.fallbacks = 0
+        self.mps_tested = False
+        self.reader = None
+        self.detect_s = self.recognize_s = 0
+        self.calls = self.boxes = 0
         torch.set_num_threads(threads)
         if torch.get_num_interop_threads() != 1:
             torch.set_num_interop_threads(1)
-        self.reader = easyocr.Reader(languages, gpu=False, verbose=False, download_enabled=download)
-        self.detect_s = self.recognize_s = 0
-        self.calls = self.boxes = 0
+        try:
+            self._initialize()
+            if self.device == "mps":
+                self.smoke_test()
+                self.mps_tested = self.device == "mps"
+                self.detect_s = self.recognize_s = 0
+                self.calls = self.boxes = 0
+        except Exception:
+            if self.device == "mps" and device == "auto":
+                self._fallback()
+            else:
+                failed_device = self.device
+                self.close()
+                raise OCRBackendError(f"EasyOCR initialization failed on {failed_device}; check models and hardware diagnostics") from None
+
+    def _initialize(self):
+        self.reader = self.easyocr.Reader(self.languages, gpu="mps" if self.device == "mps" else False,
+                                          verbose=False, download_enabled=self.download)
+        if self.device == "mps":
+            if str(self.reader.device) != "mps":
+                raise RuntimeError("EasyOCR did not select MPS")
+            for name in ("detector", "recognizer"):
+                model = getattr(self.reader, name)
+                if hasattr(model, "module"):
+                    model = model.module
+                    setattr(self.reader, name, model)
+                if not all(p.device.type == "mps" for p in model.parameters()):
+                    raise RuntimeError("OCR model parameters are not on MPS")
+
+    def _fallback(self):
+        self.close()
+        self.device = "cpu"
+        self.fallbacks += 1
+        print("MPS operation failed; retrying the complete OCR operation on CPU", file=sys.stderr, flush=True)
+        try:
+            self._initialize()
+        except Exception:
+            self.close()
+            raise OCRBackendError("CPU OCR initialization failed after MPS failure; no output was written") from None
+
+    def synchronize(self):
+        if self.device == "mps":
+            self.torch.mps.synchronize()
+
+    def close(self):
+        self.reader = None
+        if self.device == "mps":
+            try:
+                self.torch.mps.empty_cache()
+            except RuntimeError:
+                pass
+
+    def smoke_test(self):
+        image = np.full((128, 512, 3), 255, np.uint8)
+        cv2.putText(image, "SAMPLE 12345", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
+        results = self.read(image)
+        if not any("SAMPLE" in normalize(text) for _, text, _ in results):
+            raise RuntimeError("OCR smoke test did not recognize the synthetic sample")
+        return True
 
     def read(self, image, scale=1, preprocess="none", tuned=True, rotation=False):
+        try:
+            return self._read(image, scale, preprocess, tuned, rotation)
+        except Exception:
+            if self.device == "mps" and self.requested_device == "mps":
+                raise OCRBackendError("MPS OCR inference failed; processing aborted. Try --device cpu or --hardware-info --inference-test") from None
+            if self.device != "mps":
+                raise
+        self._fallback()
+        return self._read(image, scale, preprocess, tuned, rotation)
+
+    def _read(self, image, scale=1, preprocess="none", tuned=True, rotation=False):
         if scale != 1:
             image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -465,12 +545,15 @@ class OCR:
             gray = cv2.addWeighted(gray, 1.6, cv2.GaussianBlur(gray, (0, 0), 1), -.6, 0)
         params = dict(min_size=8, text_threshold=.5, low_text=.25, mag_ratio=1,
                       add_margin=.1, slope_ths=.3, canvas_size=2560) if tuned else {}
+        self.synchronize()
         t = time.perf_counter(); horizontal, free = self.reader.detect(gray, **params)
+        self.synchronize()
         self.detect_s += time.perf_counter() - t
         t = time.perf_counter()
         results = self.reader.recognize(gray, horizontal[0], free[0], workers=0,
                                        contrast_ths=.2 if tuned else .1, adjust_contrast=.7 if tuned else .5,
                                        rotation_info=[90, 180, 270] if rotation else None)
+        self.synchronize()
         self.recognize_s += time.perf_counter() - t
         self.calls += 1; self.boxes += len(results)
         return [(np.asarray(p, np.float32) / scale, text, float(prob)) for p, text, prob in results]
@@ -534,6 +617,17 @@ def encode(input_path, destination, meta, masks, args, workspace):
 
 
 def run(args):
+    resources = []
+    try:
+        return _run(args, resources)
+    finally:
+        for ocr in resources:
+            close = getattr(ocr, "close", None)
+            if close:
+                close()
+
+
+def _run(args, resources):
     start = time.perf_counter()
     source = Path(args.input).resolve(); destination = Path(args.output).resolve()
     config_path = Path(args.config).resolve()
@@ -561,9 +655,13 @@ def run(args):
     if not meta["frames"]:
         raise ValueError("No decodable frames found")
     cv2.setNumThreads(args.opencv_threads)
-    t = time.perf_counter(); ocr = OCR(args.threads, args.languages.split(","), args.download_models)
+    t = time.perf_counter(); ocr = OCR(args.threads, args.languages.split(","), args.download_models, args.device)
+    resources.append(ocr)
     init_s = time.perf_counter() - t
-    print(f'Video: {meta["frames"]} frames, {meta["fps"]} FPS; CPU OCR initialized in {init_s:.2f} s', flush=True)
+    print(f'Platform: {platform.system()}; architecture: {platform.machine()}; '
+          f'PyTorch device: {getattr(ocr, "device", "cpu")}; OCR backend: EasyOCR; '
+          f'hardware acceleration: {"enabled" if getattr(ocr, "device", "cpu") == "mps" else "disabled"}', flush=True)
+    print(f'Video: {meta["frames"]} frames, {meta["fps"]} FPS; OCR initialized in {init_s:.2f} s', flush=True)
     with tempfile.TemporaryDirectory(prefix=".anonymize-", dir=destination.parent) as temporary:
         workspace = Path(temporary)
         scale = .5
@@ -630,6 +728,9 @@ def run(args):
         encoding_s = time.perf_counter() - t
     elapsed = time.perf_counter() - start
     report = {"input": meta, "output": actual, "mode": args.mode, "threads": args.threads,
+              "device": getattr(ocr, "device", "cpu"), "requested_device": args.device,
+              "mps_pipeline_tested": getattr(ocr, "mps_tested", False),
+              "cpu_fallbacks": getattr(ocr, "fallbacks", 0),
               "settings": {"margin": args.margin, "hold_frames": args.hold_frames, "roi_scale": args.roi_scale,
                            "roi_retry": args.roi_retry, "preprocess": args.preprocess, "rotation": args.rotation,
                            "fail_closed": args.fail_closed, "crf": args.crf},
@@ -647,7 +748,7 @@ def run(args):
                            "ocr_recognizer": ocr.recognize_s, "object_detection": object_s,
                            "tracking": tracking_s, "encoding": encoding_s, "total": elapsed,
                            "per_frame": elapsed / len(seeds)},
-              "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+              "peak_rss_mb": peak_rss_mb(),
               "ocr_calls": ocr.calls, "ocr_boxes": ocr.boxes,
               "frames": [{"frame": i, "scene": scenes[i], "masks": [m.record() for m in row]} for i, row in enumerate(masks)]}
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -663,6 +764,9 @@ def parser():
     p.add_argument("--config", default="redaction_data.json")
     p.add_argument("--mode", choices=("solid", "pixelate", "blur"), default="blur")
     p.add_argument("--threads", type=int, default=6)
+    p.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")
+    p.add_argument("--hardware-info", action="store_true", help="Print hardware diagnostics without processing a video")
+    p.add_argument("--inference-test", action="store_true", help="Test OCR on synthetic text with --hardware-info")
     p.add_argument("--opencv-threads", type=int, default=1)
     p.add_argument("--ocr-every", type=int, default=5)
     p.add_argument("--hold-frames", type=int, default=10)
@@ -695,9 +799,21 @@ def main():
     if len(args.color) != 3 or any(not 0 <= c <= 255 for c in args.color):
         p.error("Color must contain three numbers in the 0–255 range")
     try:
+        if args.hardware_info:
+            info = hardware_info(args.device)
+            if args.inference_test:
+                ocr = OCR(args.threads, args.languages.split(","), args.download_models, args.device)
+                try:
+                    ocr.smoke_test()
+                    info.update(selected_device=ocr.device, ocr_pipeline_tested=True,
+                                mps_pipeline_tested=ocr.mps_tested, cpu_fallbacks=ocr.fallbacks)
+                finally:
+                    ocr.close()
+            print(json.dumps(info, indent=2))
+            return 0
         run(args)
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        message = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+        message = str(exc) if isinstance(exc, (ValueError, OCRBackendError)) else type(exc).__name__
         print(f"Error: {message}", file=sys.stderr)
         return 1
     return 0

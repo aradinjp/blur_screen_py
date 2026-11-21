@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import resource
 import sys
 import tempfile
 import time
@@ -18,6 +17,7 @@ import cv2
 import numpy as np
 
 from anonymize import Matcher, OCR, ocr_masks
+from hardware import peak_rss_mb
 
 
 def main():
@@ -92,7 +92,7 @@ def main():
     total = time.perf_counter() - start
     report = {"threads": args.threads, "opencv_threads": args.opencv_threads, "init_s": init,
               "elapsed_s": total, "decode_s": decode_s, "encode_and_blur_s": encode_s,
-              "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+              "rss_mb": peak_rss_mb(),
               "frames_analyzed": len(frame_ids), "kind": args.kind, "frames": rows}
     Path(args.output).write_text(json.dumps(report, indent=2))
     print(f"Finished: {len(frame_ids)} frames, {total:.2f} s, RSS {report['rss_mb']:.0f} MiB", flush=True)
