@@ -1,4 +1,5 @@
 import json
+from fractions import Fraction
 import shutil
 import subprocess
 
@@ -7,7 +8,7 @@ import numpy as np
 import pytest
 
 from anonymize import (Mask, Matcher, apply_masks, box_poly, checked_flow, load_config,
-                     normalize, object_masks, ocr_masks, parser, probe, run,
+                     encode, normalize, object_masks, ocr_masks, parser, probe, run,
                      scene_changed, temporal_masks, surface_motion)
 
 
@@ -114,7 +115,8 @@ def test_invalid_input_and_config(tmp_path):
 
 
 @pytest.mark.parametrize("audio", [False, True])
-def test_video_roundtrip_and_audio_without_real_ocr(tmp_path, monkeypatch, audio):
+@pytest.mark.parametrize("vfr", [False, True])
+def test_video_roundtrip_and_audio_without_real_ocr(tmp_path, monkeypatch, audio, vfr):
     import anonymize
     if not shutil.which("ffmpeg"):
         pytest.skip("FFmpeg not installed")
@@ -122,6 +124,9 @@ def test_video_roundtrip_and_audio_without_real_ocr(tmp_path, monkeypatch, audio
     command = ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30000/1001:duration=0.3"]
     if audio:
         command += ["-f", "lavfi", "-i", "sine=frequency=330:duration=0.3", "-c:a", "aac"]
+    if vfr:
+        command[command.index("-i") + 1] = "testsrc2=size=160x120:rate=30:duration=0.3"
+        command += ["-vf", "setpts='if(lt(N,3),N,N+1)/(30*TB)'", "-fps_mode", "vfr"]
     subprocess.run(command + ["-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)], check=True)
 
     class FakeOCR:
@@ -136,8 +141,15 @@ def test_video_roundtrip_and_audio_without_real_ocr(tmp_path, monkeypatch, audio
     output = tmp_path / "out.mp4"
     args = parser().parse_args(["--input", str(source), "--output", str(output), "--config", str(cfg), "--ocr-every", "2", "--mode", "solid"])
     report = run(args)
-    original = probe(source); actual = probe(output)
-    assert all(original[k] == actual[k] for k in ("width", "height", "frames", "fps", "audio"))
+    original = probe(source, require_cfr=False); actual = probe(output)
+    expected = report["processing_video"]
+    assert all(expected[k] == actual[k] for k in ("width", "height", "frames", "fps", "audio"))
+    assert original["variable_fps"] == vfr
+    assert not actual["variable_fps"]
+    if vfr:
+        assert abs(original["duration"] - actual["duration"]) <= 1 / float(Fraction(actual["fps"]))
+    else:
+        assert original["frames"] == actual["frames"]
     assert actual["audio"] == (["aac"] if audio else [])
     if audio:
         packets = lambda path: subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0",
@@ -155,6 +167,24 @@ def test_failed_encode_leaves_existing_destination_intact(tmp_path):
     with pytest.raises(ValueError, match="already exists"):
         run(args)
     assert output.read_bytes() == b"previous output"
+
+
+def test_encode_preserves_screen_recording_fractional_fps(tmp_path):
+    if not shutil.which("ffmpeg"):
+        pytest.skip("FFmpeg not installed")
+    source = tmp_path / "fractional.mp4"
+    # fps filter retains the exact rational time base, as VFR normalization does.
+    rate = "26595000/1498429"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=64x64:rate=30:duration=1", "-vf", f"fps={rate}",
+                    "-c:v", "libx264", str(source)], check=True)
+    meta = probe(source)
+    assert meta["fps"] == rate
+    output = tmp_path / "out.mp4"
+    actual = encode(source, output, meta, [[] for _ in range(meta["frames"])],
+                    parser().parse_args([]), tmp_path)
+    assert all(actual[k] == meta[k] for k in ("fps", "frames", "width", "height", "audio"))
+    assert abs(actual["duration"] - meta["duration"]) < .000001
 
 
 def test_perspective_flow_uses_all_corners():
@@ -206,7 +236,7 @@ def test_exception_releases_capture_and_removes_disk_cache(tmp_path, monkeypatch
 
     monkeypatch.setattr(anonymize.cv2, "VideoCapture", Capture)
     monkeypatch.setattr(anonymize, "OCR", FailingOCR)
-    monkeypatch.setattr(anonymize, "probe", lambda path: {"frames": 2, "width": 100, "height": 100, "fps": "30"})
+    monkeypatch.setattr(anonymize, "probe", lambda path, **kwargs: {"frames": 2, "width": 100, "height": 100, "fps": "30"})
     args = parser().parse_args(["--input", str(source), "--output", str(tmp_path / "out.mp4"), "--config", str(cfg)])
     with pytest.raises(RuntimeError, match="injected"):
         run(args)

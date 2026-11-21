@@ -381,7 +381,7 @@ def apply_masks(frame, masks, mode="blur", margin=5, color=(0, 0, 0), pixel_size
     return result, mask
 
 
-def probe(path):
+def probe(path, require_cfr=True):
     if not Path(path).is_file():
         raise ValueError("Input file does not exist")
     try:
@@ -407,10 +407,11 @@ def probe(path):
         raise ValueError("FFprobe detected a damaged video stream")
     timestamps = timestamp_probe.stdout
     times = [float(row.split(",")[0]) for row in timestamps.splitlines() if row.split(",")[0].strip()]
-    if len(times) > 2 and np.max(np.abs(np.diff(times) - 1 / float(fps))) > .002:
+    variable_fps = len(times) > 2 and np.max(np.abs(np.diff(times) - 1 / float(fps))) > .002
+    if require_cfr and variable_fps:
         raise ValueError("Variable frame rate video is not supported; a constant frame rate is required")
     return {"width": video["width"], "height": video["height"], "fps": str(fps),
-            "frames": len(times), "duration": float(video.get("duration", info.get("format", {}).get("duration", len(times) / float(fps)))),
+            "variable_fps": bool(variable_fps), "frames": len(times), "duration": float(video.get("duration", info.get("format", {}).get("duration", len(times) / float(fps)))),
             "video_codec": video["codec_name"], "pixel_format": video.get("pix_fmt"),
             "audio": [s["codec_name"] for s in info["streams"] if s["codec_type"] == "audio"],
             "start": float(video.get("start_time", 0))}
@@ -562,11 +563,16 @@ class OCR:
 def encode(input_path, destination, meta, masks, args, workspace):
     cap = cv2.VideoCapture(str(input_path))
     video = workspace / "video.mp4"
+    fps = Fraction(meta["fps"])
     pix_fmt = "yuv420p" if meta["width"] % 2 == meta["height"] % 2 == 0 else "yuv444p"
     command = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
                "-s", f'{meta["width"]}x{meta["height"]}', "-r", meta["fps"], "-i", "pipe:0",
                "-an", "-c:v", "libx264", "-threads", str(args.threads), "-preset", "medium", "-crf", str(args.crf),
-               "-pix_fmt", pix_fmt, str(video)]
+               "-pix_fmt", pix_fmt,
+               # The default encoder time base approximates rates with large
+               # denominators, including average rates of screen recordings.
+               "-enc_time_base", f"{fps.denominator}:{fps.numerator}",
+               "-video_track_timescale", str(fps.numerator), str(video)]
     diagnostic = Path(args.diagnostics) if args.diagnostics else None
     if diagnostic:
         diagnostic.mkdir(parents=True, exist_ok=True)
@@ -608,8 +614,10 @@ def encode(input_path, destination, meta, masks, args, workspace):
                     "-map", "0:v:0", "-map", "1:a?", "-c", "copy", "-map_metadata", "-1",
                     "-movflags", "+faststart", str(final)], check=True, capture_output=True)
     actual = probe(final)
-    if any(actual[k] != meta[k] for k in ("frames", "fps", "width", "height", "audio")):
-        raise ValueError("Output validation failed: video or audio parameters do not match")
+    mismatches = [f"{k}: expected {meta[k]}, got {actual[k]}"
+                  for k in ("frames", "fps", "width", "height", "audio") if actual[k] != meta[k]]
+    if mismatches:
+        raise ValueError("Output validation failed: " + "; ".join(mismatches))
     if abs(actual["duration"] - meta["frames"] / float(Fraction(meta["fps"]))) > 1 / float(Fraction(meta["fps"])):
         raise ValueError("Output validation failed: video duration does not match")
     os.replace(final, destination)
@@ -651,7 +659,8 @@ def _run(args, resources):
     if "libx264" not in encoders.stdout:
         raise ValueError("This FFmpeg installation does not provide the libx264 encoder")
     config = load_config(args.config); matcher = Matcher(config["frazy_do_ukrycia"])
-    meta = probe(source)
+    meta = probe(source, require_cfr=False)
+    input_meta = meta.copy()
     if not meta["frames"]:
         raise ValueError("No decodable frames found")
     cv2.setNumThreads(args.opencv_threads)
@@ -664,6 +673,21 @@ def _run(args, resources):
     print(f'Video: {meta["frames"]} frames, {meta["fps"]} FPS; OCR initialized in {init_s:.2f} s', flush=True)
     with tempfile.TemporaryDirectory(prefix=".anonymize-", dir=destination.parent) as temporary:
         workspace = Path(temporary)
+        if meta.get("variable_fps"):
+            print(f'Variable frame rate detected; preparing constant {meta["fps"]} FPS video...', flush=True)
+            normalized = workspace / "normalized.mp4"
+            # Normalize before OCR so both analysis and rendering see identical frames.
+            # Lossless H.264 avoids an extra quantization pass; audio timestamps are
+            # shifted together with video by FFmpeg's default input timestamp handling.
+            subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", str(source),
+                            "-map", "0:v:0", "-map", "0:a?", "-vf", f'fps={meta["fps"]}',
+                            "-c:v", "libx264", "-preset", "fast", "-crf", "0",
+                            "-threads", str(args.threads), "-c:a", "copy", str(normalized)],
+                           check=True, capture_output=True)
+            source = normalized
+            meta = probe(source)
+            if not meta["frames"]:
+                raise ValueError("No frames after frame rate conversion")
         scale = .5
         small_shape = (round(meta["height"] * scale), round(meta["width"] * scale))
         grays = np.memmap(workspace / "gray.bin", mode="w+", dtype=np.uint8, shape=(meta["frames"], *small_shape))
@@ -727,7 +751,7 @@ def _run(args, resources):
         t = time.perf_counter(); actual = encode(source, destination, meta, masks, args, workspace)
         encoding_s = time.perf_counter() - t
     elapsed = time.perf_counter() - start
-    report = {"input": meta, "output": actual, "mode": args.mode, "threads": args.threads,
+    report = {"input": input_meta, "processing_video": meta, "output": actual, "mode": args.mode, "threads": args.threads,
               "device": getattr(ocr, "device", "cpu"), "requested_device": args.device,
               "mps_pipeline_tested": getattr(ocr, "mps_tested", False),
               "cpu_fallbacks": getattr(ocr, "fallbacks", 0),

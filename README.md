@@ -82,9 +82,12 @@ python anonymize.py --output preview.mp4 --diagnostics diagnostics/masks \
 
 Diagnostic PNG files show the blurred image with strip outlines. H.264 output
 preserves resolution, frame count, and constant frame rate; audio is stream-copied
-without re-encoding. Inputs without audio are supported. Variable frame rate and
-damaged streams are rejected explicitly to prevent output with an incorrect
-duration or frame count. Reduced grayscale frames are buffered on disk, while
+without re-encoding. Inputs without audio are supported. Variable frame rate inputs
+are automatically converted to a temporary constant-FPS copy at the average input
+frame rate before OCR. This may duplicate or drop frames while preserving playback
+timing to within a frame. The temporary video uses lossless H.264 and is removed
+after processing; allow additional disk space. Reports include original input and
+processing video parameters. Damaged streams are rejected explicitly. Reduced grayscale frames are buffered on disk, while
 full-resolution frames are not retained in RAM together.
 
 Optional `regions` in JSON can restrict OCR to selected areas, but they are not
